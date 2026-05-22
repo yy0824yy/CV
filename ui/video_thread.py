@@ -37,6 +37,7 @@ from core.stable_recognizers import StableGestureRecognizer, StableActionRecogni
 from core.gesture_recognizer import GestureResult
 from core.action_recognizer import ActionResult
 from core.dynamic_gesture import DynamicGestureRecognizer, DynamicGestureResult
+from core.virtual_paint import VirtualPaintCanvas
 from core.geometry import compute_body_angles
 from core.smoothing import LandmarkSmoother
 from core.distance_estimator import DistanceEstimator, DistanceReport
@@ -91,6 +92,8 @@ class VideoThread(QThread):
         self._smooth_landmarks = smooth_landmarks
         self._running = False
         self._paused = False
+        # 虚拟绘画画布（线程内引用，主线程通过下面的接口控制）
+        self.paint_canvas = VirtualPaintCanvas()
 
     # ---------- 控制接口（主线程调用） ----------
     def stop(self):
@@ -107,6 +110,22 @@ class VideoThread(QThread):
 
     def set_enable_pose(self, b: bool):
         self._enable_pose = bool(b)
+
+    # ---------- 虚拟绘画控制（主线程调用） ----------
+    def toggle_paint(self) -> bool:
+        return self.paint_canvas.toggle_enabled()
+
+    def set_paint_enabled(self, b: bool):
+        self.paint_canvas.set_enabled(b)
+
+    def clear_paint(self):
+        self.paint_canvas.clear()
+
+    def is_paint_enabled(self) -> bool:
+        return self.paint_canvas.enabled
+
+    def get_paint_color_name(self) -> str:
+        return self.paint_canvas.color_name
 
     # ---------- 主循环 ----------
     def run(self):
@@ -186,23 +205,26 @@ class VideoThread(QThread):
                         right_hand = h_o
                         right_g_name = g.name
                 # 每只手 each frame 只调用一次 update：有手传坐标，无手传 None
+                # 捕获本帧新触发的事件（用于驱动绘画动作，避免 fade 期重复触发）
                 if left_hand is not None:
-                    dyn_left.update(
+                    new_left = dyn_left.update(
                         float(left_hand.landmarks_norm[0, 0]),
                         float(left_hand.landmarks_norm[0, 1]),
                         left_g_name, t_frame,
                     )
                 else:
-                    dyn_left.update(None, None, "", t_frame)
+                    new_left = dyn_left.update(None, None, "", t_frame)
                 if right_hand is not None:
-                    dyn_right.update(
+                    new_right = dyn_right.update(
                         float(right_hand.landmarks_norm[0, 0]),
                         float(right_hand.landmarks_norm[0, 1]),
                         right_g_name, t_frame,
                     )
                 else:
-                    dyn_right.update(None, None, "", t_frame)
-                # UI 显示：优先右手，再回退左手
+                    new_right = dyn_right.update(None, None, "", t_frame)
+                # 本帧新触发的事件：用于绘画 / 状态切换驱动
+                new_event = new_right or new_left
+                # UI 显示：fade 期内仍然显示
                 dynamic_event = (
                     dyn_right.get_last_event(t_frame)
                     or dyn_left.get_last_event(t_frame)
@@ -271,6 +293,18 @@ class VideoThread(QThread):
                     cv2.putText(vis, "TOO CLOSE!  Please step back.",
                                 (40, h_v - 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
+
+                # ---------- 虚拟绘画 ----------
+                # 优先右手食指；无则左手
+                paint_hand = right_hand if right_hand is not None else left_hand
+                paint_static = right_g_name if right_hand is not None else left_g_name
+                fingertip = None
+                if paint_hand is not None:
+                    px8 = paint_hand.landmarks_px[8]
+                    fingertip = (int(px8[0]), int(px8[1]))
+                ev_name = new_event.name if new_event is not None else None
+                self.paint_canvas.update(fingertip, paint_static, ev_name)
+                self.paint_canvas.render(vis)
 
                 # ---------- 深度伪彩 ----------
                 depth_color_img = None

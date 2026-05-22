@@ -875,7 +875,14 @@ class MainWindow(QMainWindow):
             "  E        导出当前 CSV\n"
             "  O        打开设备\n"
             "  C        关闭设备\n"
-            "  Esc      关闭程序"
+            "  B        虚拟绘画开关\n"
+            "  X        清空画布\n"
+            "  Esc      关闭程序\n"
+            "\n─── 虚拟绘画手势 ───\n"
+            "  伸出食指 (Number_1)  落笔画线\n"
+            "  其他手势            抬笔\n"
+            "  Pinch 动态手势      切换颜色\n"
+            "  Grab  动态手势      清空画布"
         )
 
     def _build_shortcuts(self):
@@ -892,7 +899,25 @@ class MainWindow(QMainWindow):
         add("E", self._on_export)
         add("O", self._on_open)
         add("C", self._on_close)
+        add("B", self._on_paint_toggle)
+        add("X", self._on_paint_clear)
         add("Esc", self.close)
+
+    # ---------- 虚拟绘画 ----------
+    def _on_paint_toggle(self):
+        if self._thread is None:
+            self.statusBar().showMessage("请先打开设备")
+            return
+        enabled = self._thread.toggle_paint()
+        self.statusBar().showMessage(
+            f"虚拟绘画: {'已开启' if enabled else '已关闭'}"
+        )
+
+    def _on_paint_clear(self):
+        if self._thread is None:
+            return
+        self._thread.clear_paint()
+        self.statusBar().showMessage("画布已清空")
 
     def _cycle_view(self):
         order = [self.VIEW_COLOR, self.VIEW_DEPTH, self.VIEW_BOTH]
