@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.idea/
+.vscode/
+*.png
+*.jpg
+*.mp4
+*.npy
+*.csv
+*.json
+data/outputs/
+tools/*.png
+tools/*.npy
+*.bak
+!docs/**/*.png

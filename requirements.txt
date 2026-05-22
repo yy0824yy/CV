@@ -1,0 +1,10 @@
+# Computer Vision Course Design - Azure Kinect DK
+# Python 3.9 推荐
+opencv-python==4.8.1.78
+opencv-contrib-python==4.8.1.78
+mediapipe==0.10.9
+numpy==1.26.4
+pandas>=2.0.0
+matplotlib>=3.7.0
+PyQt5==5.15.10
+pyk4a>=1.5.0
