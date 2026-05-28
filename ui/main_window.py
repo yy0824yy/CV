@@ -26,13 +26,22 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QLabel, QWidget,
     QHBoxLayout, QVBoxLayout, QGridLayout,
     QPushButton, QFrame, QStatusBar, QAction, QShortcut,
-    QSizePolicy, QMessageBox,
+    QSizePolicy, QMessageBox, QTextEdit,
 )
 
 from ui.video_thread import VideoThread, ProcessedFrame
+from ui.llm_worker import LLMWorker
 from core.dynamic_gesture import DYNAMIC_GESTURE_CN
+from core.llm_client import LLMClient
+from core.llm_understand import (
+    build_scene_prompt, build_fall_alert_prompt, SYSTEM_PROMPT_BASE,
+    summarize_history,
+)
+from core.activity_log import ActivityRecorder
 from data.logger import DataLogger
-from config import CAMERA
+from services.web_state import get_state as get_web_state
+from services.web_server import WebServerThread
+from config import CAMERA, SYSTEM
 
 
 # ============================================================
@@ -357,7 +366,22 @@ class MainWindow(QMainWindow):
         self._thread: Optional[VideoThread] = None
         self._last_frame: Optional[ProcessedFrame] = None
         self._logger = DataLogger(root="data/outputs")
-        self._auto_csv_on_open = True
+        self._auto_csv_on_open = SYSTEM.auto_csv_on_open
+        self._device_ready = False
+        # LLM 客户端 + 当前活动 worker
+        self._llm_client = LLMClient()
+        self._llm_worker: Optional[LLMWorker] = None
+        # 跌倒告警专用 worker（与手动解读隔离，跌倒优先级更高）
+        self._alert_worker: Optional[LLMWorker] = None
+        self._last_fall_event = None  # 用于持久化保存
+        # 活动日志 + AI 日报 worker
+        self._activity = ActivityRecorder()
+        self._report_worker: Optional[LLMWorker] = None
+        # 日报默认窗口（最近多少秒的事件参与总结）
+        self._report_window_sec = 300.0
+        # Web 远程访问
+        self._web_state = get_web_state()
+        self._web_server: Optional[WebServerThread] = None
         self._build_ui()
         self._build_shortcuts()
         # 顶栏时钟
@@ -415,6 +439,10 @@ class MainWindow(QMainWindow):
     def _build_menubar(self):
         menubar = self.menuBar()
         m_file = menubar.addMenu("文件 (&F)")
+        self._act_web = QAction("启动远程访问 (家属端)", self)
+        self._act_web.triggered.connect(self._on_toggle_web_server)
+        m_file.addAction(self._act_web)
+        m_file.addSeparator()
         act_exit = QAction("退出", self)
         act_exit.triggered.connect(self.close)
         m_file.addAction(act_exit)
@@ -541,8 +569,8 @@ class MainWindow(QMainWindow):
 
     def _build_right_panel(self) -> QWidget:
         panel = QWidget()
-        panel.setMinimumWidth(310)
-        panel.setMaximumWidth(360)
+        panel.setMinimumWidth(340)
+        panel.setMaximumWidth(400)
         v = QVBoxLayout(panel)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(10)
@@ -589,7 +617,49 @@ class MainWindow(QMainWindow):
         c4.add_layout(grid)
         v.addWidget(c4)
 
-        # 不加 stretch：让 4 张卡片均匀占满纵向空间
+        # 5) AI 解读（LLM）
+        c5 = Card("AI 解读")
+        # 顶部小字：显示当前接入的 LLM 厂商
+        provider_lbl = QLabel(self._llm_client.info)
+        provider_lbl.setStyleSheet(
+            f"color:{TEXT_DIM}; font-family:{FONT_UI};"
+            f" font-size:11px; padding:0 0 4px 0;"
+        )
+        c5.add_widget(provider_lbl)
+        # 输出文本框（只读，可滚动）
+        self.llm_output = QTextEdit()
+        self.llm_output.setReadOnly(True)
+        self.llm_output.setMinimumHeight(200)
+        self.llm_output.setPlaceholderText(
+            "按 Q 或点击下方按钮，让 AI 解读当前画面"
+        )
+        self.llm_output.setStyleSheet(
+            f"QTextEdit {{ background:{PANEL2}; color:{TEXT};"
+            f" border:1px solid {BORDER}; border-radius:6px;"
+            f" padding:8px; font-family:{FONT_UI}; font-size:13px;"
+            f" line-height:1.5; }}"
+        )
+        c5.add_widget(self.llm_output)
+        # 按钮行（两行布局：解读 / 日报；清空 单独）
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.btn_llm_describe = QPushButton("解读 (Q)")
+        self.btn_llm_describe.setStyleSheet(self._btn_style_default())
+        self.btn_llm_describe.clicked.connect(self._on_llm_describe)
+        self.btn_llm_report = QPushButton("生成日报 (D)")
+        self.btn_llm_report.setStyleSheet(self._btn_style_default())
+        self.btn_llm_report.clicked.connect(self._on_llm_report)
+        self.btn_llm_clear = QPushButton("清空")
+        self.btn_llm_clear.setStyleSheet(self._btn_style_default())
+        self.btn_llm_clear.clicked.connect(lambda: self.llm_output.clear())
+        btn_row.addWidget(self.btn_llm_describe, stretch=1)
+        btn_row.addWidget(self.btn_llm_report, stretch=1)
+        btn_row.addWidget(self.btn_llm_clear)
+        c5.add_layout(btn_row)
+        # AI 卡片单独 stretch=1：让它吸收所有多余纵向空间
+        # 其他 4 张卡保持紧凑自然高度
+        v.addWidget(c5, stretch=1)
+
         return panel
 
     def _build_bottom_bar(self) -> QWidget:
@@ -704,12 +774,23 @@ class MainWindow(QMainWindow):
             self.lbl_rec_status.setStyleSheet(self._pill_style(TEXT_DIM))
             self.lbl_rec_badge.setVisible(False)
 
-    def _set_device_state(self, connected: bool):
-        if connected:
+    def _set_device_state(self, state):
+        if state is True:
+            state = "connected"
+        elif state is False:
+            state = "disconnected"
+
+        if state == "connected":
             self.lbl_dev_dot.set_color(SUCCESS)
             self.lbl_dev_text.setText("设备已连接")
             self.lbl_dev_text.setStyleSheet(
                 f"color:{SUCCESS}; font-family:{FONT_UI}; font-size:13px; font-weight:600;"
+            )
+        elif state == "starting":
+            self.lbl_dev_dot.set_color(WARNING)
+            self.lbl_dev_text.setText("设备启动中")
+            self.lbl_dev_text.setStyleSheet(
+                f"color:{WARNING}; font-family:{FONT_UI}; font-size:13px; font-weight:600;"
             )
         else:
             self.lbl_dev_dot.set_color(TEXT_LO)
@@ -733,15 +814,20 @@ class MainWindow(QMainWindow):
             return
         self.video_label.setText(self._placeholder_html(
             "正在启动设备", "请稍候 ..."))
+        self._last_frame = None
+        self._device_ready = False
         self._thread = VideoThread(source=CAMERA.source)
         self._thread.frame_ready.connect(self._on_frame)
         self._thread.error.connect(self._on_error)
         self._thread.info.connect(self._on_info)
         self._thread.start()
+        # 重置活动日志：每次打开设备视为新会话
+        self._activity.clear()
+        self._activity.session_start()
         self.btn_open.setEnabled(False)
         self.btn_pause.setEnabled(True)
-        self.btn_snap.setEnabled(True)
-        self.btn_record.setEnabled(True)
+        self.btn_snap.setEnabled(False)
+        self.btn_record.setEnabled(False)
         self.btn_export.setEnabled(True)
         self.btn_close.setEnabled(True)
         if self._auto_csv_on_open:
@@ -749,14 +835,16 @@ class MainWindow(QMainWindow):
                 self._logger.start_csv_log()
             except Exception as e:
                 self.statusBar().showMessage(f"CSV 启动失败: {e}")
-        self._set_device_state(True)
+        self._set_device_state("starting")
         self.statusBar().showMessage("正在启动设备 ...")
         self._refresh_indicators()
 
     def _on_close(self):
         if self._thread is not None:
             self._thread.stop()
-            self._thread.wait(2000)
+            if not self._thread.wait(2000):
+                self.statusBar().showMessage("设备线程仍在退出中，请稍后再试")
+                return
             self._thread = None
         rec_path = self._logger.stop_recording()
         csv_path = self._logger.stop_csv_log()
@@ -780,6 +868,7 @@ class MainWindow(QMainWindow):
             msgs.append(f"CSV 已保存: {os.path.basename(csv_path)}")
         self.statusBar().showMessage("  |  ".join(msgs))
         self._set_device_state(False)
+        self._device_ready = False
         self._refresh_indicators()
         # 复位面板
         self.row_dynamic.set_value("--", TEXT_DIM)
@@ -877,6 +966,8 @@ class MainWindow(QMainWindow):
             "  C        关闭设备\n"
             "  B        虚拟绘画开关\n"
             "  X        清空画布\n"
+            "  Q        AI 解读当前画面\n"
+            "  D        生成 AI 活动日报\n"
             "  Esc      关闭程序\n"
             "\n─── 虚拟绘画手势 ───\n"
             "  伸出食指 (Number_1)  落笔画线\n"
@@ -901,6 +992,8 @@ class MainWindow(QMainWindow):
         add("C", self._on_close)
         add("B", self._on_paint_toggle)
         add("X", self._on_paint_clear)
+        add("Q", self._on_llm_describe)
+        add("D", self._on_llm_report)
         add("Esc", self.close)
 
     # ---------- 虚拟绘画 ----------
@@ -919,6 +1012,367 @@ class MainWindow(QMainWindow):
         self._thread.clear_paint()
         self.statusBar().showMessage("画布已清空")
 
+    # ---------- AI 解读（LLM） ----------
+    def _on_llm_describe(self):
+        # 检查 LLM 是否就绪
+        if not self._llm_client.available:
+            self.llm_output.setHtml(
+                f"<span style='color:{DANGER}'>未检测到 LLM API Key。</span><br>"
+                f"<span style='color:{TEXT_DIM}; font-size:12px'>"
+                f"请在 PowerShell 中设置环境变量后重启程序，例如：<br>"
+                f"<code>$env:SILICONFLOW_API_KEY = \"sk-...\"</code></span>"
+            )
+            return
+        # 检查是否有可解读的画面
+        if self._last_frame is None:
+            self.statusBar().showMessage("请先打开设备")
+            return
+        # 防止并发：上一次还在跑就忽略
+        if self._llm_worker is not None and self._llm_worker.isRunning():
+            self.statusBar().showMessage("AI 正在思考中，请稍候...")
+            return
+
+        # 锁定按钮 + 清空旧输出 + 显示 loading 占位
+        self.btn_llm_describe.setEnabled(False)
+        self.btn_llm_describe.setText("解读中...")
+        self.llm_output.clear()
+        self.llm_output.setPlaceholderText("AI 正在分析...")
+
+        # 在 worker 启动前刚好抓取一次最新帧，构建 prompt
+        # 用 lambda 闭包，worker.run() 内执行时再调用，确保用最新帧
+        def builder() -> str:
+            frame = self._last_frame
+            if frame is None:
+                raise RuntimeError("没有可用画面")
+            return build_scene_prompt(frame)
+
+        self._llm_worker = LLMWorker(
+            client=self._llm_client,
+            prompt_builder=builder,
+            system=SYSTEM_PROMPT_BASE,
+            max_tokens=400,        # 给 80-160 字描述留足余量
+            temperature=0.6,       # 稍高一点让表达更自然
+            stream=True,
+            parent=self,
+        )
+        self._llm_worker.chunk.connect(self._on_llm_chunk)
+        self._llm_worker.done.connect(self._on_llm_done)
+        self._llm_worker.failed.connect(self._on_llm_failed)
+        self._llm_worker.start()
+
+    def _on_llm_chunk(self, piece: str):
+        # 流式：把片段追加到输出框，光标移到尾部以保持自动滚动
+        self.llm_output.moveCursor(self.llm_output.textCursor().End)
+        self.llm_output.insertPlainText(piece)
+
+    def _on_llm_done(self, full_text: str):
+        # 流式过程中已经写入，这里只重置 UI 状态
+        self.btn_llm_describe.setEnabled(True)
+        self.btn_llm_describe.setText("解读 (Q)")
+        self.statusBar().showMessage("AI 解读完成")
+        # 推送解读结果给家属端
+        self._push_web_event("describe", "🤖 AI 实时解读", text=full_text)
+
+    def _on_llm_failed(self, msg: str):
+        self.btn_llm_describe.setEnabled(True)
+        self.btn_llm_describe.setText("解读 (Q)")
+        self.llm_output.setHtml(
+            f"<span style='color:{DANGER}'>调用失败</span><br>"
+            f"<span style='color:{TEXT_DIM}; font-size:12px'>{msg}</span>"
+        )
+        self.statusBar().showMessage(f"AI 调用失败: {msg}")
+
+    # ---------- 跌倒告警闭环 ----------
+    def _on_fall_detected(self, processed: ProcessedFrame):
+        """收到跌倒事件：保存现场快照 + 调 LLM 生成告警文案。"""
+        ev = processed.fall_event
+        if ev is None:
+            return
+        self._last_fall_event = ev
+
+        # 1) 保存现场（snapshot 图 + 元数据 txt）—— 立即执行，不依赖 LLM
+        try:
+            saved = self._save_fall_record(ev, processed, llm_text="")
+            self.statusBar().showMessage(
+                f"⚠️ 检测到跌倒！现场已保存: {os.path.basename(saved['image'])}"
+            )
+        except Exception as e:
+            saved = None
+            self.statusBar().showMessage(f"跌倒事件触发，但保存现场失败: {e}")
+
+        # 立即向 Web 端推一条跌倒告警（不等 LLM）
+        self._push_web_event(
+            "fall", "⚠️ 跌倒告警",
+            text=f"检测到跌倒，躯干倾角 {ev.torso_angle_deg:.0f}°，"
+                 f"已倒地 {ev.confirmed_duration_sec:.1f}s",
+            distance=(f"{ev.person_distance_m:.2f}m"
+                      if ev.person_distance_m else None),
+        )
+
+        # 2) UI 醒目提示（即使 LLM 失败也要显示）
+        ts_str = datetime.fromtimestamp(ev.timestamp).strftime("%H:%M:%S")
+        self.llm_output.setHtml(
+            f"<div style='color:{DANGER}; font-size:14px; font-weight:600;'>"
+            f"⚠️ 跌倒告警 · {ts_str}</div>"
+            f"<div style='color:{TEXT_DIM}; font-size:11px; margin-top:4px;'>"
+            f"躯干倾角 {ev.torso_angle_deg:.0f}° · "
+            f"已倒地 {ev.confirmed_duration_sec:.1f}s · "
+            f"距离 "
+            f"{(f'{ev.person_distance_m:.2f}m' if ev.person_distance_m else '未知')}"
+            f"</div>"
+            f"<div style='color:{TEXT}; margin-top:8px;'>正在生成告警通知...</div>"
+        )
+
+        # 3) 调用 LLM 生成自然语言告警（如果客户端可用）
+        if not self._llm_client.available:
+            return
+        if self._alert_worker is not None and self._alert_worker.isRunning():
+            return  # 上一次告警还在生成
+
+        last_action = None
+        if processed.action and processed.action.valid:
+            last_action = processed.action.primary
+
+        ctx = {
+            "timestamp_str": datetime.fromtimestamp(
+                ev.timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+            "torso_angle_deg": round(ev.torso_angle_deg, 1),
+            "head_drop": round(ev.head_drop, 3),
+            "duration_sec": round(ev.confirmed_duration_sec, 2),
+            "person_distance_m": ev.person_distance_m,
+            "last_action": last_action,
+        }
+        prompt = build_fall_alert_prompt(ctx)
+
+        self._alert_worker = LLMWorker(
+            client=self._llm_client,
+            prompt_builder=lambda: prompt,
+            system=SYSTEM_PROMPT_BASE,
+            max_tokens=300,
+            temperature=0.4,
+            stream=True,
+            parent=self,
+        )
+        self._alert_worker.chunk.connect(self._on_alert_chunk)
+        self._alert_worker.done.connect(
+            lambda txt, e=ev, p=processed: self._on_alert_done(txt, e, p)
+        )
+        self._alert_worker.failed.connect(self._on_alert_failed)
+        # 用一个标志位让 chunk 第一次写入时清空"正在生成..."占位
+        self._alert_first_chunk = True
+        self._alert_worker.start()
+
+    def _on_alert_chunk(self, piece: str):
+        if getattr(self, "_alert_first_chunk", False):
+            # 把"正在生成告警通知..."替换为告警标题 + 流式文本
+            ev = self._last_fall_event
+            ts_str = datetime.fromtimestamp(
+                ev.timestamp).strftime("%H:%M:%S") if ev else ""
+            self.llm_output.clear()
+            self.llm_output.setHtml(
+                f"<div style='color:{DANGER}; font-size:14px;"
+                f" font-weight:600;'>⚠️ 跌倒告警 · {ts_str}</div>"
+                f"<div style='color:{TEXT}; margin-top:6px;'></div>"
+            )
+            self.llm_output.moveCursor(self.llm_output.textCursor().End)
+            self._alert_first_chunk = False
+        self.llm_output.moveCursor(self.llm_output.textCursor().End)
+        self.llm_output.insertPlainText(piece)
+
+    def _on_alert_done(self, full_text: str,
+                       ev, processed: ProcessedFrame):
+        self.statusBar().showMessage("⚠️ 跌倒告警已生成")
+        # 把 LLM 文本一并写入告警文件（覆盖之前空字符串的版本）
+        try:
+            self._save_fall_record(ev, processed, llm_text=full_text)
+        except Exception as e:
+            print(f"[fall] 保存告警文本失败: {e}")
+        # 推送 LLM 文案到 Web 端（家属可读完整告警通知）
+        self._push_web_event(
+            "fall", "⚠️ 跌倒告警 · AI 通知", text=full_text,
+            distance=(f"{ev.person_distance_m:.2f}m"
+                      if ev.person_distance_m else None),
+        )
+
+    def _on_alert_failed(self, msg: str):
+        self.llm_output.append(
+            f"\n[告警文案生成失败: {msg}]"
+        )
+        self.statusBar().showMessage(f"跌倒告警 LLM 失败: {msg}")
+
+    # ---------- AI 活动日报 ----------
+    def _on_llm_report(self):
+        if not self._llm_client.available:
+            self.llm_output.setHtml(
+                f"<span style='color:{DANGER}'>未检测到 LLM API Key，无法生成日报</span>"
+            )
+            return
+        if self._report_worker is not None and self._report_worker.isRunning():
+            self.statusBar().showMessage("AI 正在生成日报，请稍候...")
+            return
+
+        events = self._activity.recent_events(
+            since_seconds=self._report_window_sec)
+        if not events:
+            self.llm_output.setHtml(
+                f"<span style='color:{TEXT_DIM}; font-size:12px'>"
+                f"最近 {int(self._report_window_sec / 60)} 分钟内没有记录到任何事件。"
+                f"<br>请先打开设备并活动一会再生成日报。</span>"
+            )
+            return
+
+        # 把事件序列化为带时间戳的中文 bullet
+        event_strings = [
+            f"[{e.time_str()}] {e.description}" for e in events
+        ]
+        # 计算覆盖时长（首事件到现在）
+        duration_sec = max(1.0, time.time() - events[0].timestamp)
+
+        # 构造 prompt 用 summarize_history 帮助函数（同步调用），
+        # 但我们要流式输出 -> 自己构造 prompt 并走 LLMWorker
+        bullet = "\n".join(f"- {s}" for s in event_strings[-50:])
+        minutes = duration_sec / 60.0
+        prompt = (
+            f"用户在过去 {minutes:.1f} 分钟内的活动事件如下：\n"
+            f"{bullet}\n\n"
+            "请生成一段 4-6 句话的活动总结，要求：\n"
+            "1) 总览：用户大致在做什么、整体状态如何；\n"
+            "2) 重点事件：着重提及任何异常（跌倒 / 距离过近过远等）；\n"
+            "3) 节奏：动作切换频率、活跃程度的简短评价；\n"
+            "4) 关怀建议：1-2 句温和的提醒或鼓励；\n"
+            "5) 输出连贯自然，不使用 Markdown 标题、列表符号。"
+        )
+
+        # 锁定按钮 + 清空 + 提示
+        self.btn_llm_report.setEnabled(False)
+        self.btn_llm_report.setText("正在生成...")
+        self.llm_output.clear()
+        ts_now = datetime.now().strftime("%H:%M:%S")
+        self.llm_output.setHtml(
+            f"<div style='color:{ACCENT}; font-size:14px; font-weight:600;'>"
+            f"📋 AI 活动日报 · {ts_now}</div>"
+            f"<div style='color:{TEXT_DIM}; font-size:11px; margin-top:4px;'>"
+            f"覆盖最近 {minutes:.1f} 分钟，共 {len(events)} 条事件</div>"
+            f"<div style='color:{TEXT}; margin-top:8px;'></div>"
+        )
+        self.llm_output.moveCursor(self.llm_output.textCursor().End)
+
+        self._report_worker = LLMWorker(
+            client=self._llm_client,
+            prompt_builder=lambda: prompt,
+            system=SYSTEM_PROMPT_BASE,
+            max_tokens=500,
+            temperature=0.6,
+            stream=True,
+            parent=self,
+        )
+        self._report_worker.chunk.connect(self._on_report_chunk)
+        self._report_worker.done.connect(self._on_report_done)
+        self._report_worker.failed.connect(self._on_report_failed)
+        self._report_worker.start()
+
+    def _on_report_chunk(self, piece: str):
+        self.llm_output.moveCursor(self.llm_output.textCursor().End)
+        self.llm_output.insertPlainText(piece)
+
+    def _on_report_done(self, full_text: str):
+        self.btn_llm_report.setEnabled(True)
+        self.btn_llm_report.setText("生成日报 (D)")
+        self.statusBar().showMessage("AI 日报已生成")
+        # 推送日报到 Web 端
+        self._push_web_event("report", "📋 AI 活动日报", text=full_text)
+
+    def _on_report_failed(self, msg: str):
+        self.btn_llm_report.setEnabled(True)
+        self.btn_llm_report.setText("生成日报 (D)")
+        self.llm_output.append(f"\n[日报生成失败: {msg}]")
+        self.statusBar().showMessage(f"日报失败: {msg}")
+
+    # ---------- Web 远程服务 ----------
+    def _on_toggle_web_server(self):
+        if self._web_server is not None and self._web_server.is_alive():
+            QMessageBox.information(
+                self, "Web 远程访问",
+                f"服务正在运行：\n\n  {self._web_server.url}\n\n"
+                f"家属可在同一 wifi 下用浏览器访问该地址。\n"
+                f"（程序退出时服务会自动停止。）"
+            )
+            return
+        # 启动新服务（守护线程，无法优雅停止 —— 接受这个限制）
+        self._web_server = WebServerThread(host="0.0.0.0", port=8765)
+        self._web_server.start()
+        # 等一会让 Flask 绑端口
+        QTimer.singleShot(600, self._after_web_server_started)
+
+    def _after_web_server_started(self):
+        if self._web_server is None:
+            return
+        if self._web_server.error:
+            QMessageBox.warning(
+                self, "Web 服务启动失败",
+                f"原因：{self._web_server.error}"
+            )
+            self._web_server = None
+            return
+        url = self._web_server.url or "http://127.0.0.1:8765"
+        self._act_web.setText(f"远程访问运行中: {url}")
+        self.statusBar().showMessage(f"远程访问已启动: {url}")
+        QMessageBox.information(
+            self, "Web 远程访问",
+            f"服务已启动：\n\n  {url}\n\n"
+            f"家属端打开浏览器（手机/电脑）访问上述地址即可。\n"
+            f"功能：实时画面 · 跌倒告警推送 · AI 解读 / 日报推送。\n\n"
+            f"※ 请确保家属设备与本机在同一局域网。"
+        )
+
+    def _push_web_event(self, ev_type: str, title: str,
+                        text: str = "", **meta):
+        """统一向 web_state 推送事件。在 LLM 完成后调用。"""
+        try:
+            self._web_state.push_event({
+                "type": ev_type,
+                "title": title,
+                "text": text,
+                "meta_text": " · ".join(f"{k}={v}" for k, v in meta.items()
+                                        if v is not None),
+            })
+        except Exception:
+            pass
+
+    def _save_fall_record(self, ev, processed: ProcessedFrame,
+                          llm_text: str) -> dict:
+        """落盘保存：图像 + 元数据 txt。返回 {'image':..., 'meta':...} 路径。"""
+        out_dir = os.path.join("data", "outputs", "alerts")
+        os.makedirs(out_dir, exist_ok=True)
+        ts_str = datetime.fromtimestamp(
+            ev.timestamp).strftime("%Y%m%d_%H%M%S")
+        img_path = os.path.join(out_dir, f"fall_{ts_str}.jpg")
+        meta_path = os.path.join(out_dir, f"fall_{ts_str}.txt")
+        # 保存当前可视化帧（已带跌倒红框 + 红字）
+        try:
+            cv2.imwrite(img_path, processed.bgr)
+        except Exception:
+            pass
+        last_action = None
+        if processed.action and processed.action.valid:
+            last_action = processed.action.primary
+        with open(meta_path, "w", encoding="utf-8") as f:
+            f.write(f"[Fall Alert]\n")
+            f.write(f"timestamp        : "
+                    f"{datetime.fromtimestamp(ev.timestamp)}\n")
+            f.write(f"torso_angle_deg  : {ev.torso_angle_deg:.2f}\n")
+            f.write(f"head_drop        : {ev.head_drop:.4f}\n")
+            f.write(f"duration_sec    : "
+                    f"{ev.confirmed_duration_sec:.2f}\n")
+            f.write(f"distance_m      : "
+                    f"{ev.person_distance_m}\n")
+            f.write(f"last_action      : {last_action}\n")
+            f.write(f"image            : {img_path}\n")
+            f.write(f"\n[LLM Alert Text]\n")
+            f.write(llm_text or "(LLM 未生成或调用失败)")
+            f.write("\n")
+        return {"image": img_path, "meta": meta_path}
+
     def _cycle_view(self):
         order = [self.VIEW_COLOR, self.VIEW_DEPTH, self.VIEW_BOTH]
         try:
@@ -930,12 +1384,22 @@ class MainWindow(QMainWindow):
     # ---------------- 帧处理 ----------------
     def _on_frame(self, processed: ProcessedFrame):
         self._last_frame = processed
+        if not self._device_ready:
+            self._device_ready = True
+            self._set_device_state("connected")
+            self.btn_snap.setEnabled(True)
+            self.btn_record.setEnabled(True)
         self._render(processed)
         self._update_panel(processed)
         if self._logger.is_csv_logging():
             self._logger.append_csv(processed)
         if self._logger.is_recording():
             self._logger.append_video_frame(processed.bgr)
+        # 活动日志：抽取事件
+        self._activity.update(processed)
+        # 跌倒事件触发应用层闭环
+        if processed.fall_event is not None:
+            self._on_fall_detected(processed)
 
     def _render(self, processed: ProcessedFrame):
         if processed is None:
@@ -1018,6 +1482,7 @@ class MainWindow(QMainWindow):
     def _on_error(self, msg: str):
         self.statusBar().showMessage(f"错误: {msg}")
         QMessageBox.critical(self, "错误", msg)
+        self._device_ready = False
         self._on_close()
 
     def _on_info(self, msg: str):
@@ -1025,11 +1490,27 @@ class MainWindow(QMainWindow):
 
     # ---------------- 关闭 ----------------
     def closeEvent(self, event):
+        # 1) 停设备采集线程
         if self._thread is not None:
             self._thread.stop()
-            self._thread.wait(2000)
+            if not self._thread.wait(2000):
+                self.statusBar().showMessage("设备线程仍在退出中，窗口暂不关闭")
+                event.ignore()
+                return
+            self._thread = None
+        # 2) 等所有 LLM Worker 退出（流式调用最长几秒，可强制 terminate）
+        for attr in ("_llm_worker", "_alert_worker", "_report_worker"):
+            w = getattr(self, attr, None)
+            if w is not None and w.isRunning():
+                # 流式 API 没法主动取消 OpenAI 请求；给 1 秒优雅退出，
+                # 否则强制终止——这是关闭场景，可以接受
+                if not w.wait(1000):
+                    w.terminate()
+                    w.wait(500)
+        # 3) 关日志
         try:
             self._logger.close_all()
         except Exception:
             pass
+        # 4) Web 服务是 daemon 线程，进程退出时自动结束
         super().closeEvent(event)

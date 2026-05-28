@@ -12,7 +12,10 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-import mediapipe as mp
+try:
+    import mediapipe as mp
+except ModuleNotFoundError:
+    mp = None
 
 
 # MediaPipe Hand 21 个关键点的索引名（标准）
@@ -60,7 +63,9 @@ class HandDetector:
     """
 
     # MediaPipe 提供的手部连接线（用于绘图）
-    HAND_CONNECTIONS = mp.solutions.hands.HAND_CONNECTIONS
+    HAND_CONNECTIONS = (
+        mp.solutions.hands.HAND_CONNECTIONS if mp is not None else tuple()
+    )
 
     def __init__(
         self,
@@ -81,6 +86,11 @@ class HandDetector:
                 输出的 Left/Right 已经与用户自拍视角一致，因此默认 False（不再对调）。
                 若你升级了 mediapipe 版本后发现左右手标反了，可以传 True 来翻转。
         """
+        if mp is None:
+            raise ModuleNotFoundError(
+                "未安装 mediapipe，无法使用 HandDetector。"
+                "如果只是训练已采集的 landmark 数据，不需要实例化该类。"
+            )
         self._hands = mp.solutions.hands.Hands(
             static_image_mode=False,
             max_num_hands=max_num_hands,

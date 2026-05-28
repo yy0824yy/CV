@@ -40,6 +40,15 @@ CSV_HEADERS = [
 ]
 
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _resolve_root(root: str) -> str:
+    if os.path.isabs(root):
+        return root
+    return os.path.join(PROJECT_ROOT, root)
+
+
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -65,10 +74,10 @@ class DataLogger:
     """
 
     def __init__(self, root: str = "data/outputs"):
-        self.root = root
-        self.snap_dir = os.path.join(root, "snapshots")
-        self.video_dir = os.path.join(root, "videos")
-        self.log_dir = os.path.join(root, "logs")
+        self.root = _resolve_root(root)
+        self.snap_dir = os.path.join(self.root, "snapshots")
+        self.video_dir = os.path.join(self.root, "videos")
+        self.log_dir = os.path.join(self.root, "logs")
         _ensure_dir(self.snap_dir)
         _ensure_dir(self.video_dir)
         _ensure_dir(self.log_dir)

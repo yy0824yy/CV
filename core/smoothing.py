@@ -172,8 +172,12 @@ class WeightedVoter:
         for lbl, s in self._buf:
             weights[lbl] = weights.get(lbl, 0.0) + s
             counts[lbl] = counts.get(lbl, 0) + 1
-        # 主排序：权重和；次排序：出现次数（解平局）
-        return max(weights.items(), key=lambda kv: (kv[1], counts[kv[0]]))[0]
+        # 主排序：权重和；次排序：出现次数。权重先 round，避免
+        # 0.3 * 3 这类浮点误差破坏理论上的平局。
+        return max(
+            weights.items(),
+            key=lambda kv: (round(kv[1], 10), counts[kv[0]]),
+        )[0]
 
     @property
     def stable_score(self) -> float:

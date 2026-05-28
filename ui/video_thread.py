@@ -37,11 +37,13 @@ from core.stable_recognizers import StableGestureRecognizer, StableActionRecogni
 from core.gesture_recognizer import GestureResult
 from core.action_recognizer import ActionResult
 from core.dynamic_gesture import DynamicGestureRecognizer, DynamicGestureResult
+from core.fall_detector import FallDetector, FallEvent
 from core.virtual_paint import VirtualPaintCanvas
+from services.web_state import get_state as get_web_state
 from core.geometry import compute_body_angles
 from core.smoothing import LandmarkSmoother
 from core.distance_estimator import DistanceEstimator, DistanceReport
-from config import CAMERA, DISPLAY
+from config import CAMERA, DISPLAY, SYSTEM
 
 
 @dataclass
@@ -65,6 +67,10 @@ class ProcessedFrame:
     too_far: bool = False
     # 动态手势事件（事件型，未触发或已淡出时为 None）
     dynamic_gesture: Optional[DynamicGestureResult] = None
+    # 跌倒事件（仅在新触发的那一帧非 None；之后的帧为 None 直至下一次跌倒）
+    fall_event: Optional[FallEvent] = None
+    # 跌倒检测器当前帧的特征（用于调试 / UI 角标）
+    fall_features: Dict[str, float] = field(default_factory=dict)
     timestamp: float = 0.0
 
 
@@ -130,37 +136,84 @@ class VideoThread(QThread):
     # ---------- 主循环 ----------
     def run(self):
         # ---- 创建摄像头 ----
-        try:
-            if self._source == "kinect":
-                cam: CameraBase = create_camera(
-                    "kinect",
-                    color_resolution=CAMERA.kinect_color_resolution,
-                    depth_mode=CAMERA.kinect_depth_mode,
-                    fps=CAMERA.kinect_fps,
-                )
-            else:
-                cam = create_camera(
-                    self._source,
-                    width=CAMERA.opencv_width,
-                    height=CAMERA.opencv_height,
-                )
-            cam.open()
-            self.info.emit(f"摄像头已打开: {self._source}")
-        except Exception as e:
-            self.error.emit(f"打开摄像头失败: {e}")
+        cam: Optional[CameraBase] = None
+        active_source = self._source
+        sources = [self._source]
+        if (
+            CAMERA.enable_fallback
+            and self._source == "kinect"
+            and CAMERA.fallback_source
+            and CAMERA.fallback_source not in sources
+        ):
+            sources.append(CAMERA.fallback_source)
+
+        last_error = None
+        for source in sources:
+            candidate = None
+            try:
+                if source == "kinect":
+                    candidate: CameraBase = create_camera(
+                        "kinect",
+                        color_resolution=CAMERA.kinect_color_resolution,
+                        depth_mode=CAMERA.kinect_depth_mode,
+                        fps=CAMERA.kinect_fps,
+                    )
+                else:
+                    candidate = create_camera(
+                        source,
+                        width=CAMERA.opencv_width,
+                        height=CAMERA.opencv_height,
+                    )
+                candidate.open()
+                cam = candidate
+                active_source = source
+                if source != self._source:
+                    self.info.emit(
+                        f"{self._source} 打开失败，已切换到备用摄像头: {source}"
+                    )
+                else:
+                    self.info.emit(f"摄像头已打开: {source}")
+                break
+            except Exception as e:
+                last_error = e
+                try:
+                    candidate.close()
+                except Exception:
+                    pass
+
+        if cam is None:
+            self.error.emit(f"打开摄像头失败: {last_error}")
             return
 
         # ---- 检测器与识别器 ----
         hand_det = HandDetector(max_num_hands=2, already_flipped=False) \
             if self._enable_hand else None
         pose_det = PoseDetector(model_complexity=1) if self._enable_pose else None
-        gesture_rec = StableGestureRecognizer(window=7)
+        gesture_base = None
+        mode = SYSTEM.gesture_recognizer_mode.lower().strip()
+        if mode == "ml":
+            try:
+                from core.ml_gesture_recognizer import MLGestureRecognizer
+                gesture_base = MLGestureRecognizer(SYSTEM.gesture_model_path)
+                self.info.emit(f"手势识别模式: ML ({SYSTEM.gesture_model_path})")
+            except Exception as e:
+                self.info.emit(f"ML 手势模型不可用，已回退规则法: {e}")
+        else:
+            self.info.emit("手势识别模式: 规则法")
+        gesture_rec = StableGestureRecognizer(base=gesture_base, window=7)
         action_rec = StableActionRecognizer(window=9)
         # 动态手势：左右手各一个识别器
         dyn_left = DynamicGestureRecognizer()
         dyn_right = DynamicGestureRecognizer()
+        # 跌倒检测器
+        fall_det = FallDetector()
         lm_smoother = LandmarkSmoother(alpha=0.7)
         dist_est = DistanceEstimator(near_thr_m=0.6, far_thr_m=3.0, ema_alpha=0.4)
+
+        # Web 远程推流（共享单例 state）
+        web_state = get_web_state()
+        web_state.set_meta(source=active_source, started_at=time.time())
+        last_web_push_t = 0.0
 
         fps = 0.0
         prev_t = time.time()
@@ -251,6 +304,10 @@ class VideoThread(QThread):
                 dist_report: DistanceReport = dist_est.estimate(raw_depth, pose)
                 person_distance_m = dist_report.body_distance_m
 
+                # ---------- 跌倒检测 ----------
+                fall_event = fall_det.update(pose, person_distance_m)
+                fall_features = fall_det.last_features
+
                 # ---------- 可视化绘图 ----------
                 vis = color  # 直接画在 color 上
                 if pose is not None and pose_det is not None:
@@ -293,6 +350,25 @@ class VideoThread(QThread):
                     cv2.putText(vis, "TOO CLOSE!  Please step back.",
                                 (40, h_v - 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
+
+                # 跌倒可视化：橙色提示（疑似） / 红色 + 大字 + 红框（已确认）
+                fall_state = fall_features.get("state", "normal")
+                if fall_state in ("suspect", "fallen", "cooldown"):
+                    h_v, w_v = vis.shape[:2]
+                    if fall_state == "suspect":
+                        # 疑似：橙色顶部条
+                        cv2.rectangle(vis, (0, 0), (w_v - 1, 36), (0, 140, 255), -1)
+                        cv2.putText(vis, "Fall risk detected ...",
+                                    (16, 26),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    else:
+                        # fallen / cooldown：满屏红色边框 + 大号红字
+                        cv2.rectangle(vis, (0, 0), (w_v - 1, h_v - 1),
+                                      (0, 0, 255), 12)
+                        cv2.putText(vis, "FALL DETECTED!",
+                                    (40, 70),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.6,
+                                    (0, 0, 255), 4)
 
                 # ---------- 虚拟绘画 ----------
                 # 优先右手食指；无则左手
@@ -337,9 +413,23 @@ class VideoThread(QThread):
                     too_close=dist_report.too_close,
                     too_far=dist_report.too_far,
                     dynamic_gesture=dynamic_event,
+                    fall_event=fall_event,
+                    fall_features=fall_features,
                     timestamp=now,
                 )
                 self.frame_ready.emit(processed)
+                # ---------- Web 推流（限速 ~10 fps，CPU 友好） ----------
+                if (now - last_web_push_t) >= 0.1:
+                    try:
+                        ok, buf = cv2.imencode(
+                            ".jpg", vis,
+                            [int(cv2.IMWRITE_JPEG_QUALITY), 75],
+                        )
+                        if ok:
+                            web_state.push_frame(buf.tobytes())
+                        last_web_push_t = now
+                    except Exception:
+                        pass
         except Exception as e:
             self.error.emit(f"采集线程异常: {e}")
         finally:
@@ -351,4 +441,4 @@ class VideoThread(QThread):
                 hand_det.close()
             if pose_det is not None:
                 pose_det.close()
-            self.info.emit("采集线程已停止")
+            self.info.emit(f"采集线程已停止: {active_source}")

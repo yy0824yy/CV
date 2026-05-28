@@ -24,9 +24,11 @@
 from __future__ import annotations
 
 import glob
+import json
 import os
 import sys
 import warnings
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -39,7 +41,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.base import clone
 from sklearn.model_selection import (
-    StratifiedKFold, cross_val_predict, train_test_split,
+    StratifiedKFold, LeaveOneGroupOut, cross_val_predict, train_test_split,
 )
 from sklearn.metrics import (
     accuracy_score, f1_score, classification_report, confusion_matrix,
@@ -47,9 +49,11 @@ from sklearn.metrics import (
 
 # 为了加噪后能重跑规则识别器
 import sys as _sys
-_sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_sys.path.insert(0, ROOT)
 from core.gesture_recognizer import GestureRecognizer
 from core.hand_detector import HandLandmarks
+from core.ml_gesture_recognizer import landmarks_to_features_batch
 
 # 中文字体（沿用 analyze.py 风格）
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
@@ -57,9 +61,12 @@ plt.rcParams["axes.unicode_minus"] = False
 warnings.filterwarnings("ignore")
 
 
-LABELED_DIR = os.path.join("data", "outputs", "labeled")
-FIG_DIR = os.path.join("data", "outputs", "figures")
+LABELED_DIR = os.path.join(ROOT, "data", "outputs", "labeled")
+FIG_DIR = os.path.join(ROOT, "data", "outputs", "figures")
+MODEL_DIR = os.path.join(ROOT, "models")
+MODEL_PATH = os.path.join(MODEL_DIR, "gesture_rf.joblib")
 os.makedirs(FIG_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 
 # ============================================================
@@ -111,12 +118,7 @@ def landmarks_to_features(lm: np.ndarray) -> np.ndarray:
     把 (N, 21, 3) landmarks 转成 (N, 63) 特征。
     1) 减 wrist  2) 除 palm_size
     """
-    wrist = lm[:, 0:1, :]
-    centered = lm - wrist
-    palm = np.linalg.norm(centered, axis=2).max(axis=1, keepdims=True)
-    palm = np.where(palm < 1e-6, 1.0, palm)
-    norm = centered / palm[:, :, None]
-    return norm.reshape(len(lm), -1)
+    return landmarks_to_features_batch(lm)
 
 
 def extract_features(df: pd.DataFrame) -> np.ndarray:
@@ -168,6 +170,119 @@ def evaluate_model(name: str, model, X: np.ndarray, y: np.ndarray,
     f1 = f1_score(y, y_pred, average="macro")
     print(f"    {name}: 准确率 = {acc:.4f}  macro-F1 = {f1:.4f}")
     return {"name": name, "acc": acc, "f1": f1, "y_pred": y_pred}
+
+
+def evaluate_group_holdout(name: str, model, X: np.ndarray, y: np.ndarray,
+                           groups: np.ndarray) -> Optional[dict]:
+    """按采集文件留一验证，降低连续帧随机打散带来的数据泄漏。"""
+    unique_groups = np.unique(groups)
+    if len(unique_groups) < 2:
+        print(f"  [跳过] {name}: 只有 1 个采集文件，无法做留一文件验证")
+        return None
+
+    logo = LeaveOneGroupOut()
+    y_true_all = []
+    y_pred_all = []
+    skipped = 0
+    classes_all = set(y)
+    for train_idx, test_idx in logo.split(X, y, groups):
+        y_train = y[train_idx]
+        # 如果某个训练折缺少类别，跳过；否则模型无法学习完整标签空间。
+        if set(y_train) != classes_all:
+            skipped += 1
+            continue
+        m = clone(model)
+        m.fit(X[train_idx], y_train)
+        y_true_all.extend(y[test_idx].tolist())
+        y_pred_all.extend(m.predict(X[test_idx]).tolist())
+
+    if not y_true_all:
+        print(
+            f"  [跳过] {name}: 留一文件后训练集类别不完整，"
+            "建议每个采集文件都包含全部手势类别"
+        )
+        return None
+
+    acc = accuracy_score(y_true_all, y_pred_all)
+    f1 = f1_score(y_true_all, y_pred_all, average="macro")
+    print(
+        f"  [文件留一] {name}: 准确率 = {acc:.4f}  macro-F1 = {f1:.4f}"
+        + (f"  跳过折数={skipped}" if skipped else "")
+    )
+    return {"name": name, "acc": acc, "f1": f1, "n": len(y_true_all)}
+
+
+def chronological_split_indices(df: pd.DataFrame, train_ratio: float = 0.7):
+    """每个类别按采集顺序切分，前段训练、后段测试。"""
+    train_idx = []
+    test_idx = []
+    for _label, sub in df.groupby("gt_label", sort=False):
+        idx = sub.index.to_numpy()
+        if len(idx) < 3:
+            continue
+        cut = int(len(idx) * train_ratio)
+        cut = max(1, min(cut, len(idx) - 1))
+        train_idx.extend(idx[:cut].tolist())
+        test_idx.extend(idx[cut:].tolist())
+    return np.array(train_idx, dtype=int), np.array(test_idx, dtype=int)
+
+
+def evaluate_chronological_holdout(name: str, model, X: np.ndarray,
+                                   y: np.ndarray, df: pd.DataFrame
+                                   ) -> Optional[dict]:
+    """按时间前后段划分，避免同一连续动作片段被随机打散。"""
+    train_idx, test_idx = chronological_split_indices(df)
+    if len(train_idx) == 0 or len(test_idx) == 0:
+        print(f"  [跳过] {name}: 时间分段数据不足")
+        return None
+    if set(y[train_idx]) != set(y):
+        print(f"  [跳过] {name}: 时间分段训练集类别不完整")
+        return None
+    m = clone(model)
+    m.fit(X[train_idx], y[train_idx])
+    pred = m.predict(X[test_idx])
+    acc = accuracy_score(y[test_idx], pred)
+    f1 = f1_score(y[test_idx], pred, average="macro")
+    print(
+        f"  [时间分段] {name}: 准确率 = {acc:.4f}  macro-F1 = {f1:.4f}"
+        f"  train={len(train_idx)} test={len(test_idx)}"
+    )
+    return {"name": name, "acc": acc, "f1": f1,
+            "train": int(len(train_idx)), "test": int(len(test_idx))}
+
+
+def save_final_model(model, X: np.ndarray, y: np.ndarray, labels: list) -> str:
+    """用全部带标签数据训练最终 RF 模型并保存，供实时系统加载。"""
+    import joblib
+
+    final_model = clone(model)
+    final_model.fit(X, y)
+    payload = {
+        "model": final_model,
+        "model_name": "RandomForest",
+        "classes": labels,
+        "train_samples": int(len(y)),
+        "feature_version": "wrist_centered_palm_norm_v1",
+    }
+    joblib.dump(payload, MODEL_PATH)
+    print(f"\n[OUT] 已保存实时手势模型: {MODEL_PATH}")
+    return MODEL_PATH
+
+
+def save_metrics_summary(path: str, random_results: list,
+                         strict_results: dict) -> None:
+    data = {
+        "random_5fold": [
+            {"name": r["name"], "acc": float(r["acc"]), "f1": float(r["f1"])}
+            for r in random_results
+        ],
+        "strict": strict_results,
+        "model_path": path,
+    }
+    out = os.path.join(FIG_DIR, "gesture_training_summary.json")
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"[OUT] 训练摘要: {out}")
 
 
 # ============================================================
@@ -419,6 +534,7 @@ def main():
     X = landmarks_to_features(lm_raw)
     y = df["gt_label"].astype(str).to_numpy()
     hand_sides = df["hand_side"].astype(str).tolist()
+    groups = df["__source"].astype(str).to_numpy()
     labels = sorted(set(y))
     print(f"[INFO] 特征维度: {X.shape}，类别数: {len(labels)} -> {labels}")
 
@@ -472,6 +588,25 @@ def main():
         print(f"  {r['name']:<14} {r['acc']*100:>9.2f}% {r['f1']:>10.4f}")
 
     # ============================================================
+    # 更严格的评估：按采集文件留一 + 按时间分段
+    # ============================================================
+    print("\n[INFO] 更严格的数据划分评估（用于报告可信度）:")
+    strict_results = {"leave_one_file": [], "chronological": []}
+    strict_models = {"RandomForest": rf, "MLP": mlp, "SVM (RBF)": svm}
+    for name, model in strict_models.items():
+        r_group = evaluate_group_holdout(name, model, X, y, groups)
+        if r_group is not None:
+            strict_results["leave_one_file"].append(r_group)
+        r_time = evaluate_chronological_holdout(name, model, X, y, df)
+        if r_time is not None:
+            strict_results["chronological"].append(r_time)
+
+    # ============================================================
+    # 保存实时系统使用的最终模型
+    # ============================================================
+    model_path = save_final_model(rf, X, y, labels)
+
+    # ============================================================
     # 进阶实验：鲁棒性 + 学习曲线
     # ============================================================
     ml_models = {"RandomForest": rf, "MLP": mlp, "SVM (RBF)": svm}
@@ -481,6 +616,7 @@ def main():
     run_learning_curve(X, lm_raw, y, ml_models,
                        per_class_sizes=(2, 5, 10, 20, 40, 60),
                        n_repeats=5, seed=42, noise_sigma=0.02)
+    save_metrics_summary(model_path, results, strict_results)
 
 
 if __name__ == "__main__":

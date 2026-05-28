@@ -14,7 +14,10 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-import mediapipe as mp
+try:
+    import mediapipe as mp
+except ModuleNotFoundError:
+    mp = None
 
 
 # ============================================================
@@ -78,7 +81,9 @@ class PoseLandmarks:
 class PoseDetector:
     """MediaPipe Pose 的轻量封装（单人）。"""
 
-    POSE_CONNECTIONS = mp.solutions.pose.POSE_CONNECTIONS
+    POSE_CONNECTIONS = (
+        mp.solutions.pose.POSE_CONNECTIONS if mp is not None else tuple()
+    )
 
     def __init__(
         self,
@@ -94,6 +99,11 @@ class PoseDetector:
             enable_segmentation: 是否输出人体分割掩码（耗时，默认关）
             smooth_landmarks: MediaPipe 内部的时序平滑（与我们 Step 7 的平滑互补）
         """
+        if mp is None:
+            raise ModuleNotFoundError(
+                "未安装 mediapipe，无法使用 PoseDetector。"
+                "请先执行 python -m pip install -r requirements.txt"
+            )
         self._pose = mp.solutions.pose.Pose(
             static_image_mode=False,
             model_complexity=model_complexity,

@@ -15,10 +15,18 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional
 
 import cv2
 import numpy as np
+
+
+def _pick(mapping: Dict, key, name: str):
+    """带清晰错误信息的配置映射选择。"""
+    if key not in mapping:
+        supported = ", ".join(str(k) for k in mapping.keys())
+        raise ValueError(f"无效的 {name}: {key}。支持: {supported}")
+    return mapping[key]
 
 
 # ============================================================
@@ -141,10 +149,16 @@ class KinectCamera(CameraBase):
         }
         fps_map = {5: FPS.FPS_5, 15: FPS.FPS_15, 30: FPS.FPS_30}
 
+        color_resolution = _pick(
+            color_map, self.color_resolution, "Kinect 彩色分辨率"
+        )
+        depth_mode = _pick(depth_map, self.depth_mode, "Kinect 深度模式")
+        camera_fps = _pick(fps_map, self.fps, "Kinect FPS")
+
         cfg = Config(
-            color_resolution=color_map[self.color_resolution],
-            depth_mode=depth_map[self.depth_mode],
-            camera_fps=fps_map[self.fps],
+            color_resolution=color_resolution,
+            depth_mode=depth_mode,
+            camera_fps=camera_fps,
             synchronized_images_only=True,  # 仅输出 RGB 与 Depth 都齐的帧
         )
         self._k4a = PyK4A(cfg)
@@ -197,6 +211,8 @@ def create_camera(source: str = "kinect", **kwargs) -> CameraBase:
     Returns:
         CameraBase 子类实例（尚未 open）
     """
+    if not source:
+        raise ValueError("摄像头源不能为空。支持: 'kinect' 或 'opencv:<index>'")
     s = source.lower().strip()
     if s == "kinect":
         return KinectCamera(**kwargs)

@@ -68,7 +68,7 @@ class TestGestureTriggerBasic:
             trig.update("Right", "OK")
         trig.update("Right", "Unknown")
         # 此时只有 1 帧 OK 在最新位置
-        for _ in range(3):
+        for _ in range(4):
             evt = trig.update("Right", "OK")
             assert evt is None
         # 再 1 帧补满 5 帧
